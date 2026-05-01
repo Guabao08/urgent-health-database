@@ -24,7 +24,7 @@ const AddPatientForm = ({ onAdded }) => {
     };
 
     try {
-      await fetch('http://localhost:8000/api/patients', {
+      await fetch('/api/patients', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newPatient)

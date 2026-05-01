@@ -4,7 +4,7 @@ import AddPatientForm from './components/AddPatientForm';
 import HeapVisualizer from './components/HeapVisualizer';
 import { Activity } from 'lucide-react';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = '';
 
 function App() {
   const [queue, setQueue] = useState([]);
