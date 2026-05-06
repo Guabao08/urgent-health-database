@@ -12,6 +12,8 @@ Falls back to an in-memory heap if no Supabase credentials are found.
 import os
 import time
 import math
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 import streamlit as st
 import plotly.graph_objects as go
 from dotenv import load_dotenv
@@ -129,17 +131,29 @@ if "fallback_heap" not in st.session_state:
 
 # ── Data layer ────────────────────────────────────────────────────────────────
 
+# Real Supabase table columns:
+#   id (uuid), patient_name, phone_number, symptoms, severity_score, created_at
+# The heap and UI use normalised keys: name, priority, created_at, phone_number
+
+def _normalise(row: dict) -> dict:
+    """Map Supabase column names to the internal field names the app uses."""
+    out = dict(row)
+    out["name"]     = row.get("patient_name") or row.get("name", "Unknown")
+    out["priority"] = int(row.get("severity_score") or row.get("priority") or 0)
+    return out
+
+
 def load_heap() -> FourAryHeap:
-    """Fetch all active patients from Supabase and load into a fresh heap."""
+    """Fetch all records from urgent_care_calls and load into a fresh heap."""
     if supabase:
         try:
             resp = (
-                supabase.table("patients")
+                supabase.table("urgent_care_calls")
                 .select("*")
-                .eq("status", "active")
                 .execute()
             )
-            return FourAryHeap.build_from_list(resp.data)
+            normalised = [_normalise(r) for r in resp.data]
+            return FourAryHeap.build_from_list(normalised)
         except Exception as exc:
             st.warning(f"Supabase error — using in-memory fallback. ({exc})")
             return st.session_state.fallback_heap
@@ -147,22 +161,27 @@ def load_heap() -> FourAryHeap:
 
 
 def db_add_patient(data: dict) -> None:
+    """Insert a new call using the real column names."""
     if supabase:
-        supabase.table("patients").insert(data).execute()
+        supabase.table("urgent_care_calls").insert({
+            "patient_name":  data["name"],
+            "phone_number":  data.get("phone_number", ""),
+            "symptoms":      data.get("symptoms", ""),
+            "severity_score": data["priority"],
+        }).execute()
     else:
         st.session_state.fallback_heap.insert(data)
 
 
-def db_mark_processed(patient_id: int) -> None:
+def db_delete_patient(patient_id: str) -> None:
+    """Remove a processed call from the table (no status column exists)."""
     if supabase:
-        supabase.table("patients").update({"status": "processed"}).eq(
-            "id", patient_id
-        ).execute()
+        supabase.table("urgent_care_calls").delete().eq("id", patient_id).execute()
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 
-def priority_tier(score: int) -> tuple[str, str, str]:
+def priority_tier(score: int) -> Tuple[str, str, str]:
     """Return (label, hex_colour, semi-transparent_bg) for a priority score."""
     if score >= 15:
         return "CRITICAL", "#ef4444", "rgba(239,68,68,0.12)"
@@ -171,8 +190,18 @@ def priority_tier(score: int) -> tuple[str, str, str]:
     return "LOW", "#10b981", "rgba(16,185,129,0.12)"
 
 
-def format_wait(ts_ms: int) -> str:
-    mins = max(0, int((time.time() * 1000 - ts_ms) / 60_000))
+def format_wait(ts) -> str:
+    """Accept either an ISO datetime string or epoch-ms integer."""
+    try:
+        if isinstance(ts, str):
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            mins = max(0, int((datetime.now(timezone.utc) - dt).total_seconds() / 60))
+        else:
+            mins = max(0, int((time.time() * 1000 - int(ts)) / 60_000))
+    except Exception:
+        return "unknown"
     if mins < 1:
         return "< 1 min"
     if mins < 60:
@@ -182,7 +211,7 @@ def format_wait(ts_ms: int) -> str:
 
 # ── Plotly tree builder ───────────────────────────────────────────────────────
 
-def _compute_positions(n: int) -> dict[int, tuple[float, float]]:
+def _compute_positions(n: int) -> Dict[int, Tuple[float, float]]:
     """
     Recursively assign (x, y) display coordinates.
     Root → (0.5, 0).  Each subtree gets an equal horizontal slice.
@@ -243,7 +272,8 @@ def build_heap_figure(heap_array: list[dict]) -> go.Figure:
     hover_text  = [
         (
             f"<b>{heap_array[i].get('name', 'Unknown')}</b><br>"
-            f"Priority : {heap_array[i].get('priority', 0)}/20<br>"
+            f"Severity : {heap_array[i].get('priority', 0)}/20<br>"
+            f"Phone    : {heap_array[i].get('phone_number', 'N/A')}<br>"
             f"Symptoms : {heap_array[i].get('symptoms', 'N/A')}<br>"
             f"Heap idx : {i}  |  depth : {int(-pos[i][1])}"
         )
@@ -335,7 +365,8 @@ with st.sidebar:
     st.markdown("#### Admit Patient")
 
     with st.form("admit_form", clear_on_submit=True):
-        p_name     = st.text_input("Name", placeholder="Full name")
+        p_name     = st.text_input("Patient Name", placeholder="Full name")
+        p_phone    = st.text_input("Phone Number", placeholder="e.g. 720-473-1234")
         p_priority = st.slider("Severity  (1 = minor  ·  20 = critical)", 1, 20, 10)
         p_symptoms = st.text_area("Symptoms", placeholder="Describe presenting symptoms", height=90)
         submitted  = st.form_submit_button("Admit →", use_container_width=True, type="primary")
@@ -344,14 +375,11 @@ with st.sidebar:
             if not p_name.strip():
                 st.error("Patient name is required.")
             else:
-                now_ms = int(time.time() * 1000)
                 new_patient = {
-                    "id":        now_ms,
-                    "name":      p_name.strip(),
-                    "priority":  p_priority,
-                    "symptoms":  p_symptoms.strip(),
-                    "status":    "active",
-                    "timestamp": now_ms,
+                    "name":         p_name.strip(),
+                    "phone_number": p_phone.strip(),
+                    "priority":     p_priority,
+                    "symptoms":     p_symptoms.strip(),
                 }
                 try:
                     db_add_patient(new_patient)
@@ -372,7 +400,7 @@ with st.sidebar:
             processed = h.extract_max()
             if processed:
                 try:
-                    db_mark_processed(processed["id"])
+                    db_delete_patient(processed["id"])
                     st.success(f"Processed: {processed['name']}")
                     st.rerun()
                 except Exception as exc:
@@ -405,7 +433,7 @@ with tab_queue:
         nxt = queue[0]
         lbl, clr, bg = priority_tier(nxt["priority"])
         pct = int((nxt["priority"] / 20) * 100)
-        wait_str = format_wait(nxt.get("timestamp", int(time.time() * 1000)))
+        wait_str = format_wait(nxt.get("created_at", nxt.get("timestamp", int(time.time() * 1000))))
         syms_full = nxt.get("symptoms") or "No symptoms reported"
 
         st.markdown(
@@ -445,6 +473,7 @@ with tab_queue:
               <div style="color:#d1d5db; font-size:0.95rem; margin-top:0.5rem;">
                 {syms_full}
               </div>
+              {f'<div style="color:#6b7280; font-size:0.8rem; margin-top:0.4rem;">📞 {nxt["phone_number"]}</div>' if nxt.get("phone_number") else ""}
             </div>
             """,
             unsafe_allow_html=True,
@@ -456,8 +485,9 @@ with tab_queue:
 
         for rank, p in enumerate(queue, 1):
             lbl_r, clr_r, bg_r = priority_tier(p["priority"])
-            wait_r  = format_wait(p.get("timestamp", int(time.time() * 1000)))
+            wait_r  = format_wait(p.get("created_at") or p.get("timestamp", int(time.time() * 1000)))
             name_r  = p.get("name", "Unknown")
+            phone_r = p.get("phone_number", "")
             syms_r  = (p.get("symptoms") or "No symptoms")
             if len(syms_r) > 65:
                 syms_r = syms_r[:65] + "…"
@@ -480,6 +510,7 @@ with tab_queue:
                   <span style="flex:0 0 170px; font-weight:600; white-space:nowrap;
                                overflow:hidden; text-overflow:ellipsis;">
                     {name_r}
+                    {f'<span style="display:block;font-size:0.7rem;font-weight:400;color:#6b7280;">{phone_r}</span>' if phone_r else ""}
                   </span>
                   <span style="flex:1; font-size:0.84rem; color:#9ca3af;
                                white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
@@ -589,7 +620,7 @@ with tab_tree:
         for d, level in enumerate(levels):
             max_p   = max(p.get("priority", 0) for p in level)
             _, clr_d, _ = priority_tier(max_p)
-            names   = ", ".join(p.get("name", "?") for p in level)
+            names   = ", ".join(p.get("name") or p.get("patient_name", "?") for p in level)
             scores  = " · ".join(str(p.get("priority", "?")) for p in level)
             st.markdown(
                 f'<div style="display:flex; align-items:center; gap:1rem;'
